@@ -1,0 +1,11 @@
+name: ShinyWordPredictor
+title: ShinyWordPredictor
+account: dtelliott79
+server: shinyapps.io
+appId: 161773
+bundleId: 736907
+url: https://dtelliott79.shinyapps.io/ShinyWordPredictor/
+when: 1488898950.10929
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: Example/server.R|Example/ui.R

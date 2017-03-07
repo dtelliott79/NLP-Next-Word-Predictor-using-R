@@ -1,0 +1,579 @@
+# Background:
+
+### This R script downloads, opens, processes and analyzes a textual data set as part of the Coursera Data Science Capstone offered through Johns Hopkins University. 
+
+### The data processing component requires approximately 7 hours to complete on the full 556 MB of text (on system with duo 2.1 GHz processors, 4 GB RAM, running Windows 7 64-bit). The majority of this time is spent in cleaning the text, tokenizing bigrams and trigrams, and calculating the accuracy of the final model predictions on the test sets.
+
+### Preliminary analyses indicated that working with more than 5% of the data at a time often went very slowly or resulted in an "out of memory" error in R. Therefore, the data are split into 40 partitions, 2.5% each, for processing. Data partitions are read and written to/from file between computationally intesive components to allow for the entire dataset to be processed using the limited capacity of the processing system. These partitions are then combined post-processing into training and test sets.
+
+### Statistical treatment of the processed data was based on textbook knowledge on NGram modelling (Chapter 4 in Jurafsky & Martin, 2000).
+
+### The final processed data, along with the final prediction model function, are combined into a GUI based Shiny Application, available at (https://dtelliott79.shinyapps.io/ShinyWordPredictor/)
+
+#### Note that the 7 hour run-time is for "one time" data pre-processing only. The final Shiny Application runs on about 50-100 MB of memory, and yields predictions within a comparable time frame to manual text entry by a user.
+
+
+```{r setup, echo=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+options(java.parameters = "- Xmx1024m")
+library(stringr)
+library(tm)
+library(RWeka)
+library(ggplot2)
+library(dplyr)
+library(Hmisc)
+library(data.table)
+library(lattice)
+#library(filehash)
+```
+
+## Download and Unzip the Data, Separating into Manageable Partitions
+```{r getdata, echo=TRUE, cache=TRUE}
+datafolder <- paste(c(getwd(), "/data"), collapse="")
+url  <- "http://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+fname <- "Coursera-SwiftKey.zip"
+fpath <- paste(datafolder, fname, sep="/")
+if (!file.exists(fpath)){
+        download.file(url, destfile=fpath, method="curl")
+        unzip(zipfile=fpath, exdir=datafolder)
+}
+
+# Read in the data
+flist <- list.files(path=datafolder, recursive=T, pattern=".*en_.*.txt")
+textfolder <- paste(datafolder, "final/en_US", sep="/")
+con <- file(paste(datafolder, flist, sep="/")[1], open = "r")
+blog <- readLines(con, skipNul = TRUE)
+close(con)
+con <- file(paste(datafolder, flist, sep="/")[2], open = "rb")
+news <- readLines(con, encoding="utf-8" , skipNul = TRUE)
+close(con)
+con <- file(paste(datafolder, flist, sep="/")[3], open = "r")
+twit <- readLines(con, skipNul = TRUE)
+close(con)
+# Note that the "en_US.news.txt" file needed to be opened in binary to successfully read the entire file
+
+blogsize <- file.size(paste(datafolder, flist, sep="/")[1])/1024/1024
+newssize <- file.size(paste(datafolder, flist, sep="/")[2])/1024/1024
+twitsize <- file.size(paste(datafolder, flist, sep="/")[3])/1024/1024
+
+docs <- c(blog, news, twit)
+rm(blog, news, twit)
+
+# Randomly split the data into a given number (n) of equally sized partitions
+n <- 40
+objlist <- character()
+for (i in 1:n){
+        set.seed(1234+i)
+        sub <- sample(length(docs), floor(length(docs) * 1/(n-i+1)))
+        assign(paste0("docs",i), docs[sub])
+        objlist <- c(objlist, paste0("docs",i))
+        docs <- docs[-sub]
+}
+rm(docs, sub)
+
+Corplist <- character()
+for (i in 1:length(objlist)){
+        assign(paste0("Corpus",i),Corpus(VectorSource(list(get(objlist[i])))))
+        Corplist <- c(Corplist, paste0("Corpus",i))
+}
+rm(list = objlist, objlist)
+
+# Save each Corpus subset to disk
+for (i in 1:length(Corplist)){
+        Corpus <- get(Corplist[i])
+        saveRDS(Corpus, file = paste0("Corpus",i,".rds"))
+        print(paste0("Corpus",i," saved to disk"))
+        rm(Corpus)
+}
+rm(list = Corplist)
+
+gc()
+```
+#### The full blog file is `r format(blogsize,scientific=FALSE,trim=TRUE)` MB.
+#### The full news file is `r format(newssize,scientific=FALSE,trim=TRUE)` MB.
+#### The full twitter file is `r format(twitsize,scientific=FALSE,trim=TRUE)` MB.
+
+## Clean the Data (Including Optional Profanity Filtering)
+```{r cleandata, echo=TRUE, cache=TRUE}
+clean <- function(doc){
+        doc <- tm_map(doc, tolower)
+        doc <- tm_map(doc, removeNumbers)
+        
+        key <- c("’", "'", "‘", "'", "aren't", "are not", 
+                 "can't", "can not",
+                 "could've", "could have", "couldn't", "could not", 
+                 "didn't", "did not", "doesn't", "does not", 
+                 "don't", "do not",
+                 "hadn't", "had not", "hasn't", "has not", 
+                 "haven't", "have not", "he'd", "he had", 
+                 "he'll", "he will",
+                 "he's", "he is", "how'd", "how did", 
+                 "how'll", "how will",
+                 "how's", "how is", "I'd", "I would", 
+                 "I'll", "I will", 
+                 "I'm", "I am", "I've", "I have", 
+                 "isn't", "is not", "it'd", "it had", 
+                 "it'll", "it will",
+                 "it's", "it is", "mightn't", "might not", 
+                 "might've", "might have", "mustn't", "must not", 
+                 "must've", "must have",
+                 "needn't", "need not", "she'd", "she had", 
+                 "she'll", "she will", "she's", "she is", 
+                 "should've", "should have",
+                 "shouldn't", "should not", "somebody's", "somebody is",
+                 "someone's", "someone is", "something's", "something is",
+                 "that'll", "that will", "that's", "that is", 
+                 "that'd", "that would", "there'd", "there had", 
+                 "there's", "there is", "they'd", "they had", 
+                 "they'll", "they will", "they're", "they are", 
+                 "they've", "they have", 
+                 "wasn't", "was not", "we'd", "we had", 
+                 "we'll", "we will", 
+                 "we're", "we are", "we've", "we have", 
+                 "weren't", "were not", 
+                 "what'd", "what did", "what'll", "what will", 
+                 "what're", "what are", "what's", "what is", 
+                 "what've", "what have", 
+                 "when's", "when is", "where'd", "where did", 
+                 "where's", "where is", "where've", "where have", 
+                 "who'd", "who did", 
+                 "who'll", "who will", "who's", "who is", 
+                 "why'd", "why did", 
+                 "why're", "why are", "why's", "why is", 
+                 "won't", "will not", 
+                 "would've", "would have", "wouldn't", "would not", 
+                 "you'd", "you would", "you'll", "you will", 
+                 "you're", "you are", "you've", "you have", 
+                 "–", ' ', "—", ' ', "‚", ' ', "“", ' ', "€", ' ', 
+                 "™", ' ', "â", ' ', "œ", ' ', "˜", ' ', "…", ' ', "”", ' ', 
+                 "•", ' ', "• •", ' ', "ã", ' ', "„", ' ', "‹", ' ', 
+                 "ðÿ", ' ', "ð", ' ', "ÿ", ' ', "‹ ‹", ' ')
+        contractions <- key[c(TRUE, FALSE)]
+        full <- key[c(FALSE, TRUE)]
+        
+        for (i in 1:length(contractions)){
+                exchanger <- function(x) gsub(contractions[i], full[i], x)
+                doc <- tm_map(doc, exchanger)
+        }
+        
+        doc <- tm_map(doc, removePunctuation)
+        doc <- tm_map(doc, removeWords, 
+                      c("s", "g", "mg", "m", "t", "re", "p", 
+                        "d", "ve", "u", "th", 
+                        "", "\u009d","$","--","-","st","/",
+                        "<","˜","“", '"', "—", '-', "–", "-"," - ", 
+                        "•", "…", "”", "â", "€", "œ", "™", "$",
+                        "/", "˜"))
+        #NEED TO FIND A MORE APPROPRIATE LIST OF PROFANITIES
+        #if (!file.exists(paste(datafolder, "bad-words.txt", sep="/"))){
+                #download.file(url
+                #="http://www.cs.cmu.edu/~biglou/resources/bad-words.txt",
+                #destfile = paste(datafolder, "bad-words.txt", sep="/"))
+        #badWords = readLines(paste(datafolder, "bad-words.txt", sep="/"))
+        #doc <- tm_map(doc, removeWords, badWords)
+        doc <- tm_map(doc, stripWhitespace)
+        doc <- tm_map(doc, PlainTextDocument)
+}
+
+#Corplist <- paste0(rep("Corpus",40), seq(1:40))
+
+# Load each Corpus subset, transform it with the specified function, and save it back to disk under a modified name
+transformer <- function(filelst, func, type = "Corpus", ...){
+        for (i in 1:length(filelst)){
+                file <- paste0(filelst[i],".rds")
+                file <- readRDS(file)
+                print(paste0(filelst[i], " loaded from disk"))
+                file <- func(file, ...)
+                print(paste0(filelst[i], " transformed to ", type,i))
+                saveRDS(file, file = paste0(type,i,".rds"))
+                print(paste0(type,i," saved to disk"))
+        }
+}
+
+transformer(Corplist, clean, type = "CleanCorpus")
+
+gc()
+```
+
+## Tokenize Bigrams and Trigrams
+```{r prelim, echo=TRUE, cache=TRUE}
+tokens <- function(doc, min, max){
+        gc()
+        file <- DocumentTermMatrix(doc, control = list(wordLengths=c(1,Inf),
+                    tokenize = function(x) 
+                            {RWeka::NGramTokenizer(
+                                    x,RWeka::Weka_control(
+                                            min = min, max = max)
+                                    )
+                            }
+                    )
+                )
+        gc()
+        file <- sort(colSums(as.matrix(file)), decreasing=TRUE)
+        gc()
+        return(file)
+}
+
+Corplist <- paste0(rep("CleanCorpus",40), seq(1:40))
+
+transformer <- function(filelst, func, type = "Corpus", ...){
+        for (i in 1:length(filelst)){
+                file <- paste0(filelst[i],".rds")
+                file <- readRDS(file)
+                print(paste0(filelst[i], " loaded from disk"))
+                file <- func(file, ...)
+                print(paste0(filelst[i], " transformed to ", type,i))
+                saveRDS(file, file = paste0(type,i,".rds"))
+                print(paste0(type,i," saved to disk"))
+        }
+}
+
+transformer(Corplist, tokens, type = "Bigrams", min = 2, max = 2)
+transformer(Corplist, tokens, type = "Trigrams", min = 3, max = 3)
+
+gc()
+```
+
+## Convert to Dataframes, Combine Partitions, and Calculate Maximum Likelihoods
+```{r model, echo=TRUE, cache=TRUE}
+# Convert bigram/trigram vectors into dataframes with predictor word, predicted word, and frequency of each combination
+calcs1 <- function(v, numout){
+        # Subset to use only frequencies > 2, per Jurafsky & Martin (2000)
+        v <- v[which(v > numout)]
+        predictor <- word(names(v),end=-2)
+        predicted <- word(names(v),-1)
+        df <- as.data.frame(cbind(predictor = predictor, 
+                                  predicted = predicted, 
+                                  frequency = v))
+        # Clean stubborn special characters
+        df <- df[!grepl("[[:punct:]]", df$predictor),]
+        df <- df[!grepl("[[:punct:]]", df$predicted),]
+        df <- df[word(df$predictor) != "\u009d",]
+        df <- df[word(df$predicted) != "\u009d",]
+        df$frequency <- as.numeric(as.character(df$frequency))
+        return(df)
+}
+
+# Split the list of data files into training (75%) and testing (25%) lists
+set.seed(1234)
+Index <- seq(1:40)
+set.seed(1234)
+TrainIndex <- sort(sample(Index,30))
+TestIndex <- sort(Index[!(Index %in% TrainIndex)])
+
+Bigramlist <- paste0(rep("Bigrams",40), seq(1:40))
+BigramlistTrain <- Bigramlist[TrainIndex]
+BigramlistTest <- Bigramlist[TestIndex]
+
+Trigramlist <- paste0(rep("Trigrams",40), seq(1:40))
+TrigramlistTrain <- Trigramlist[TrainIndex]
+TrigramlistTest <- Trigramlist[TestIndex]
+
+rm(Index, TrainIndex, TestIndex, Bigramlist, Trigramlist)
+
+transformer <- function(filelst, func, type = "Corpus", ...){
+        for (i in 1:length(filelst)){
+                file <- paste0(filelst[i],".rds")
+                file <- readRDS(file)
+                print(paste0(filelst[i], " loaded from disk"))
+                file <- func(file, ...)
+                print(paste0(filelst[i], " transformed to ", type,i))
+                saveRDS(file, file = paste0(type,i,".rds"))
+                print(paste0(type,i," saved to disk"))
+        }
+}
+
+transformer(BigramlistTrain, calcs1, type = "BigramsTrain", numout = 2)
+transformer(BigramlistTest, calcs1, type = "BigramsTest", numout = 2)
+transformer(TrigramlistTrain, calcs1, type = "TrigramsTrain", numout = 2)
+transformer(TrigramlistTest, calcs1, type = "TrigramsTest", numout = 2)
+
+gc()
+
+# Combine all subsets into larger data frames, summing frequencies for each  predictor & predicted word combination
+# Then calculate Maximum likelihood estimates for Bigrams (not needed for Trigrams, as those will be calculated as part of the Good-Turing Smoothing and Katz Back-off below)
+# Finally, save resulting combined dataframes
+combiner <- function(filelst, type, ...){
+        maindf <- data.frame()
+        for (i in 1:length(filelst)){
+                file <- paste0(filelst[i],".rds")
+                df <- readRDS(file)
+                print(paste0(filelst[i], " loaded from disk"))
+                maindf <- bind_rows(maindf, df)
+        }
+        maindf <- maindf %>% group_by(predictor, predicted) %>%
+                summarise(frequency = sum(frequency))
+        return(maindf)
+}
+
+BigramlistTrain2 <- paste0(rep("BigramsTrain",30), seq(1:30))
+BigramlistTest2 <- paste0(rep("BigramsTest",10), seq(1:10))
+TrigramlistTrain2 <- paste0(rep("TrigramsTrain",30), seq(1:30))
+TrigramlistTest2 <- paste0(rep("TrigramsTest",10), seq(1:10))
+
+BigramsTrain <- combiner(BigramlistTrain2, type = "BigramsTraindf")
+BigramsTrain$MLE <- with(BigramsTrain, ave(frequency, predictor, FUN=prop.table))
+saveRDS(BigramsTrain, file = "BigramsTrain.rds")
+rm(BigramsTrain)
+gc()
+BigramsTest <- combiner(BigramlistTest2, type = "BigramsTestdf")
+BigramsTest$MLE <- with(BigramsTest, ave(frequency, predictor, FUN=prop.table))
+saveRDS(BigramsTest, file = "BigramsTest.rds")
+rm(BigramsTest)
+gc()
+TrigramsTrain <- combiner(TrigramlistTrain2, type = "TrigramsTraindf")
+saveRDS(TrigramsTrain, file = "TrigramsTrain.rds")
+rm(TrigramsTrain)
+gc()
+TrigramsTest <- combiner(TrigramlistTest2, type = "TrigramsTestdf")
+saveRDS(TrigramsTest, file = "TrigramsTest.rds")
+rm(TrigramsTest)
+gc()
+```
+
+## Good-Turing Smoothing
+```{r smooth, echo=TRUE, cache=TRUE}
+smooth <- function(df){
+        gtncs <- table(df$frequency)
+        df$gtNc <- as.numeric(with(df,gtncs[as.character(df$frequency)]))
+        df$lngtNc <- log(df$gtNc)
+        df$lnfrequency <- log(df$frequency)
+        df$lnfrequencyplus1 <- log(df$frequency+1)
+        linreg <- lm(lngtNc ~ lnfrequency, data = df)
+        p <- xyplot(lngtNc ~ lnfrequency, data = df,
+               xlab = "ln(Frequency)",
+               ylab = "ln(Frequency of Frequency)",
+               type = c("p", "r")
+               )
+        df$lngtNc <- NULL
+        #summary(linreg)
+        preddf <- as.data.frame(df$lnfrequency)
+        df$lnfrequency <- NULL
+        colnames(preddf) <- "lnfrequency"
+        df$gtNc <- exp(predict(linreg, preddf))
+        preddf <- as.data.frame(df$lnfrequencyplus1)
+        df$lnfrequencyplus1 <- NULL
+        colnames(preddf) <- "lnfrequency"
+        df$gtNcplus1 <- exp(predict(linreg, preddf))
+        df$gtcount <- with(df, (frequency+1) * gtNcplus1/gtNc)
+        df$gtNc <- NULL
+        df$gtNcplus1 <- NULL
+        sums <- aggregate(df$frequency, by=list(df$predictor), FUN=sum)
+        sums2 <- sums[,2]
+        names(sums2) <- as.character(sums[,1])
+        df$Pstar <- df$gtcount/sums2[as.character(df$predictor)]
+        print(p)
+        return(df)
+}
+
+# Read back in dataframes and get rid of more pesky special characters
+BigramTraindf <- readRDS("BigramsTrain.rds")
+BigramTraindf <- BigramTraindf[
+        min(which(BigramTraindf$predictor == "a")):dim(BigramTraindf)[1],]
+BigramTraindf <- BigramTraindf[order(BigramTraindf$predicted),]
+BigramTraindf <- BigramTraindf[
+        min(which(BigramTraindf$predicted == "a")):dim(BigramTraindf)[1],]
+BigramTraindf <- BigramTraindf[order(BigramTraindf$predictor),]
+
+BigramTestdf <- readRDS("BigramsTest.rds")
+BigramTestdf <- BigramTestdf[
+        min(which(BigramTestdf$predictor == "a")):dim(BigramTestdf)[1],]
+BigramTestdf <- BigramTestdf[order(BigramTestdf$predicted),]
+BigramTestdf <- BigramTestdf[
+        min(which(BigramTestdf$predicted == "a")):dim(BigramTestdf)[1],]
+BigramTestdf <- BigramTestdf[order(BigramTestdf$predictor),]
+
+TrigramTraindf <- readRDS("TrigramsTrain.rds")
+TrigramTraindf <- TrigramTraindf[
+        min(which(substr(TrigramTraindf$predictor, 1, 1) 
+                  == "a")):dim(TrigramTraindf)[1],]
+TrigramTraindf <- TrigramTraindf[order(TrigramTraindf$predicted),]
+TrigramTraindf <- TrigramTraindf[
+        min(which(TrigramTraindf$predicted == "a")):dim(TrigramTraindf)[1],]
+TrigramTraindf <- TrigramTraindf[order(TrigramTraindf$predictor),]
+
+TrigramTestdf <- readRDS("TrigramsTest.rds")
+TrigramTestdf <- TrigramTestdf[
+        min(which(substr(TrigramTestdf$predictor, 1, 1) 
+                  == "a")):dim(TrigramTestdf)[1],]
+TrigramTestdf <- TrigramTestdf[order(TrigramTestdf$predicted),]
+TrigramTestdf <- TrigramTestdf[
+        min(which(TrigramTestdf$predicted == "a")):dim(TrigramTestdf)[1],]
+TrigramTestdf <- TrigramTestdf[order(TrigramTestdf$predictor),]
+
+TrigramTraindf <- smooth(TrigramTraindf)
+
+# Final data clean and save
+BigramTraindf <- BigramTraindf %>% group_by(predictor) %>%
+                select(predictor, predicted, MLE) %>%
+                rename(probability = MLE) %>%
+                top_n(3, probability) %>%
+                arrange(predictor)
+
+TrigramTraindf <- TrigramTraindf %>% group_by(predictor) %>%
+                select(predictor, predicted, Pstar) %>%
+                rename(probability = Pstar) %>%
+                top_n(3, probability) %>%
+                arrange(predictor)
+
+BigramTraindf <- as.data.table(BigramTraindf)
+TrigramTraindf <- as.data.table(TrigramTraindf)
+
+saveRDS(BigramTraindf, file = "BigramTraindf.rds")
+saveRDS(TrigramTraindf, file = "TrigramTraindf.rds")
+saveRDS(BigramTestdf, file = "BigramTestdf.rds")
+saveRDS(TrigramTestdf, file = "TrigramTestdf.rds")
+
+rm(list= ls())
+
+gc()
+```
+### The graph above shows the results of a log-log regression of frequency of terms versus frequency of frequencies, used as part of the Good-Turing smoothing (see Chapter 4 in Jurafsky & Martin, 2000).
+
+## Katz Back-Off, Application Development, and Model Accuracy Assessment
+```{r backoff, echo=TRUE, cache=TRUE}
+bigramdf <- readRDS("BigramTraindf.rds")
+trigramdf <- readRDS("TrigramTraindf.rds")
+
+BigramTestdf <- readRDS("BigramTestdf.rds")
+TrigramTestdf <- readRDS("TrigramTestdf.rds")
+
+# Key to convert user entered contractions into long form that will match up with the predictors in the processed data
+key <- c("’", "'", "‘", "'", "aren't", "are not", "can't", "can not",
+         "could've", "could have", "couldn't", "could not", 
+         "didn't", "did not", "doesn't", "does not", "don't", "do not",
+         "hadn't", "had not", "hasn't", "has not", "haven't", "have not",
+         "he'd", "he had", "he'll", "he will", "he's", "he is", 
+         "how'd", "how did", "how'll", "how will", "how's", "how is", 
+         "I'd", "I would", "I'll", "I will", "I'm", "I am", "I've", "I have", 
+         "isn't", "is not", "it'd", "it had", "it'll", "it will", 
+         "it's", "it is", "mightn't", "might not", "might've", "might have",
+         "mustn't", "must not", "must've", "must have", "needn't", "need not",
+         "she'd", "she had", "she'll", "she will", "she's", "she is",
+         "should've", "should have", "shouldn't", "should not", 
+         "somebody's", "somebody is", "someone's", "someone is", 
+         "something's", "something is", "that'll", "that will", 
+         "that's", "that is", "that'd", "that would", "there'd", "there had",
+         "there's", "there is", "they'd", "they had", "they'll", "they will",
+         "they're", "they are", "they've", "they have", "wasn't", "was not",
+         "we'd", "we had", "we'll", "we will", "we're", "we are", 
+         "we've", "we have", "weren't", "were not", "what'd", "what did",
+         "what'll", "what will", "what're", "what are", "what's", "what is",
+         "what've", "what have", "when's", "when is", "where'd", "where did",
+         "where's", "where is", "where've", "where have", "who'd", "who did", 
+         "who'll", "who will", "who's", "who is", "why'd", "why did", 
+         "why're", "why are", "why's", "why is", "won't", "will not", 
+         "would've", "would have", "wouldn't", "would not", 
+         "you'd", "you would", "you'll", "you will", "you're", "you are",
+         "you've", "you have")
+        
+contractions <- key[c(TRUE, FALSE)]
+full <- key[c(FALSE, TRUE)]
+
+# Word prediction algorithm to be used in Shiny Application
+predictalg <- function(ngram, 
+                      contr = contractions, 
+                      f = full,
+                      df1 = trigramdf,
+                      df2 = bigramdf){
+        ngram <- tolower(ngram)
+        ngram <- gsub("[^'[:lower:] ]", "", ngram)
+        ngram <- gsub("\\s+"," ", ngram)
+        ngram <- word(ngram,-2:-1)
+        for (i in 1:2){
+                if (ngram[2] %in% contr){
+                        index <- which(contr == ngram[2])
+                        ngram <- gsub(contr[index], f[index],
+                                      ngram[2])
+                        ngram <- word(ngram,-2:-1)
+                }
+                if (ngram[1] %in% contr){
+                        index <- which(contr == ngram[1])
+                        ngram[1] <- gsub(contr[index], f[index],
+                                         ngram[1])
+                        ngram[1] <- word(ngram[1],-1)
+                }
+        }
+        ngram <- paste(ngram[1],ngram[2])
+        pred <- data.table()
+        prob1 <- 0
+        
+        if (ngram %in% df1$predictor){
+                pred <- df1[predictor == ngram]
+                prob1 <- sum(pred[,probability])
+        }
+        
+        if (dim(pred)[1] < 3){
+                nm1gram <- word(ngram,-1)
+                pred2 <- df2[predictor == nm1gram]
+                TriBeta <- 1 - prob1
+                pred2$probability <- TriBeta * pred2$probability
+                pred <- rbind.data.frame(pred,pred2)
+                rm(pred2)
+        }
+        
+        pred <- pred %>% group_by(predicted) %>%
+                summarise(probability = sum(probability)) %>%
+                arrange(-probability) %>%
+                top_n(3, probability)
+        
+        if (dim(pred)[1] == 0){
+                pred <- data.frame(predicted = c(".", "?", "!"), probability =
+                                           c(1/3,1/3,1/3))
+        }
+        
+        return(pred[[1]])
+}
+
+# RUN THESE 9 LINES FOR APP TYPE SIMULATION...
+#repeat {
+#        ngraminp <- readline('Enter an n-gram: ')
+#        predictions <- predictalg(ngraminp)
+#        exit = 0
+#        exit <- readline('Enter 1 to exit: ')
+#        if (exit == 1){
+#                break
+#        }
+#}
+##################################################
+
+# Calculate accuracy of model predictions on test sets
+BigramPredictions <- lapply(BigramTestdf$predictor, predictalg)
+df  <-  do.call(rbind.data.frame, BigramPredictions)
+df <- df[,1:3]
+BigramTestdf <- bind_cols(BigramTestdf, df)
+colnames(BigramTestdf)[5] <- "prediction1"
+colnames(BigramTestdf)[6] <- "prediction2"
+colnames(BigramTestdf)[7] <- "prediction3"
+saveRDS(BigramTestdf, file = "BigramTestdf.rds")
+rm(BigramPredictions, df)
+
+TrigramPredictions <- lapply(TrigramTestdf$predictor, predictalg)
+df  <-  do.call(rbind.data.frame, TrigramPredictions)
+df <- df[,1:3]
+TrigramTestdf <- bind_cols(TrigramTestdf, df)
+colnames(TrigramTestdf)[4] <- "prediction1"
+colnames(TrigramTestdf)[5] <- "prediction2"
+colnames(TrigramTestdf)[6] <- "prediction3"
+saveRDS(TrigramTestdf, file = "TrigramTestdf.rds")
+rm(TrigramPredictions, df)
+
+BigramTestdf <- readRDS("BigramTestdf.rds")
+TrigramTestdf <- readRDS("TrigramTestdf.rds")
+
+BigramTestdf <- BigramTestdf %>% ungroup() %>% mutate(firstpred = (frequency * (prediction1 == predicted))/sum(frequency))
+BigramTestdf <- BigramTestdf %>% ungroup() %>% mutate(top3pred = (frequency * (prediction1 == predicted | prediction2 == predicted | prediction3 == predicted))/sum(frequency))
+firstaccuracyBi <- 100*sum(BigramTestdf$firstpred)
+top3accuracyBi <- 100*sum(BigramTestdf$top3pred)
+
+TrigramTestdf <- TrigramTestdf %>% ungroup() %>% mutate(firstpred = (frequency * (prediction1 == predicted))/sum(frequency))
+TrigramTestdf <- TrigramTestdf %>% ungroup() %>% mutate(top3pred = (frequency * (prediction1 == predicted | prediction2 == predicted | prediction3 == predicted))/sum(frequency))
+firstaccuracyTri <- 100*sum(TrigramTestdf$firstpred)
+top3accuracyTri <- 100*sum(TrigramTestdf$top3pred)
+```
+#### The model predicted first word had `r format(firstaccuracyBi,scientific=FALSE,trim=TRUE)` % accuracy when predicting from 1 word and `r format(firstaccuracyTri,scientific=FALSE,trim=TRUE)` % accuracy when predicting from 2 words.
+#### The model predicted top 3 words had `r format(top3accuracyBi,scientific=FALSE,trim=TRUE)` % accuracy when predicting from 1 word and `r format(top3accuracyTri,scientific=FALSE,trim=TRUE)` % accuracy when predicting from 2 words.
+
+## References:
+
+#### Jurafsky, D. & Martin, J.H. (2000). Speech and language processing: An introduction to natural language processing, computational linguistics and speech recognition. Englewood Cliffs, NJ: Prentice Hall.
